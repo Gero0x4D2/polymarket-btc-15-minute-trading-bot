@@ -44,11 +44,17 @@ class FusedSignal:
 
 class SignalFusionEngine:
     def __init__(self):
+        # Weights reflect signal quality and independence.
+        # Sentiment + DeribitPCR are both slow contrarian indicators → lower weight each.
+        # DeribitPCR is also deduplicated in the strategy when Sentiment fires same direction.
         self.weights = {
-            "SpikeDetection":    0.40,
-            "PriceDivergence":   0.30,
-            "SentimentAnalysis": 0.20,
-            "default":           0.10,
+            "SpikeDetection":     0.35,
+            "PriceDivergence":    0.25,
+            "OrderBookImbalance": 0.20,  # Real-time, forward-looking
+            "TickVelocity":       0.10,  # Real-time price action
+            "SentimentAnalysis":  0.05,  # Daily indicator — intentionally low weight
+            "DeribitPCR":         0.05,  # Daily indicator — intentionally low weight
+            "default":            0.05,
         }
         
         self._signal_history: List[FusedSignal] = []

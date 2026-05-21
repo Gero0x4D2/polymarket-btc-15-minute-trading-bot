@@ -9,6 +9,8 @@
 .env.production
 .env.development
 *.env
+# Template with no real secrets — must be tracked
+!.env.example
 
 # Any file with "secret", "private", "key", "credential" in the name
 *secret*

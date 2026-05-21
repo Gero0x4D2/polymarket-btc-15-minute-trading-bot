@@ -14,18 +14,19 @@ from py_clob_client.clob_types import OrderArgs, OrderType as PolyOrderType
 from py_clob_client.order_builder.constants import BUY, SELL
 POLYMARKET_AVAILABLE = True
 
+from execution.base_client import BaseMarketClient, MarketInfo, OrderBook, TradeRecord
 
-class PolymarketClient:
+
+class PolymarketClient(BaseMarketClient):
     """
     Production Polymarket API client.
-    
-    Features:
-    - Real order placement
-    - Live market data
-    - Position tracking
-    - Balance management
+
+    Implements BaseMarketClient — use PolymarketClient wherever a
+    BaseMarketClient is expected.
     """
-    
+
+    platform_name = "polymarket"
+
     def __init__(
         self,
         private_key: Optional[str] = None,
@@ -132,39 +133,52 @@ class PolymarketClient:
         self.client = None
         logger.info("Disconnected from Polymarket")
     
-    async def get_btc_market(self) -> Optional[Dict[str, Any]]:
-        """
-        Get BTC prediction market details.
-        
-        Returns:
-            Market information dict
-        """
+    async def get_btc_markets(self, limit: int = 10) -> List[MarketInfo]:
+        """Return open BTC 15-minute markets from Polymarket Gamma API."""
         if not self.client:
             logger.error("Client not connected")
-            return None
-        
+            return []
+
         try:
-            # Search for BTC markets
-            # Note: You'll need to find the specific market ID for your BTC price prediction
-            # This is a placeholder - update with actual market ID
-            
-            # Example: Get market by condition ID
-            # markets = self.client.get_markets()
-            
-            # For now, return a mock structure
-            # TODO: Implement actual market search
-            logger.warning("BTC market lookup not fully implemented")
-            
-            return {
-                "condition_id": "BTC_PRICE_PREDICTION",  # Replace with real ID
-                "market_id": "btc_market",
-                "question": "Will BTC be above $65000?",
-                "end_date": "2026-03-01",
-            }
-            
+            import httpx
+            resp = httpx.get(
+                "https://gamma-api.polymarket.com/markets",
+                params={"tag": "crypto", "active": True, "limit": 50},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            raw = resp.json()
+
+            markets: List[MarketInfo] = []
+            for m in raw:
+                question = m.get("question", "")
+                if "BTC" not in question.upper():
+                    continue
+                close_time = None
+                if m.get("endDate"):
+                    try:
+                        close_time = datetime.fromisoformat(m["endDate"].replace("Z", "+00:00"))
+                    except ValueError:
+                        pass
+                markets.append(MarketInfo(
+                    market_id=m.get("conditionId", m.get("id", "")),
+                    question=question,
+                    platform=self.platform_name,
+                    probability=Decimal(str(m.get("bestAsk", m.get("outcomePrices", ["0.5"])[0]))),
+                    volume=Decimal(str(m.get("volume", 0))),
+                    close_time=close_time,
+                    yes_token_id=m.get("clobTokenIds", [None])[0],
+                    metadata=m,
+                ))
+                if len(markets) >= limit:
+                    break
+
+            logger.info(f"Found {len(markets)} BTC markets on Polymarket")
+            return markets
+
         except Exception as e:
-            logger.error(f"Error fetching BTC market: {e}")
-            return None
+            logger.error(f"Error fetching BTC markets: {e}")
+            return []
     
     async def get_market_price(self, token_id: str) -> Optional[Decimal]:
         """
@@ -194,115 +208,75 @@ class PolymarketClient:
             logger.error(f"Error fetching market price: {e}")
             return None
     
-    async def get_orderbook(self, token_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Get order book for token.
-        
-        Args:
-            token_id: Token ID
-            
-        Returns:
-            Order book with bids and asks
-        """
+    async def get_orderbook(self, market_id: str) -> Optional[OrderBook]:
+        """Return CLOB order book for the YES token of *market_id*."""
         if not self.client:
             return None
-        
+
         try:
-            book = self.client.get_order_book(token_id)
-            
-            return {
-                "timestamp": datetime.now(),
-                "token_id": token_id,
-                "bids": [
-                    {
-                        "price": Decimal(str(bid["price"])),
-                        "size": Decimal(str(bid["size"])),
-                    }
-                    for bid in book.get("bids", [])
+            book = self.client.get_order_book(market_id)
+            return OrderBook(
+                market_id=market_id,
+                timestamp=datetime.now(),
+                bids=[
+                    {"price": Decimal(str(b["price"])), "size": Decimal(str(b["size"]))}
+                    for b in book.get("bids", [])
                 ],
-                "asks": [
-                    {
-                        "price": Decimal(str(ask["price"])),
-                        "size": Decimal(str(ask["size"])),
-                    }
-                    for ask in book.get("asks", [])
+                asks=[
+                    {"price": Decimal(str(a["price"])), "size": Decimal(str(a["size"]))}
+                    for a in book.get("asks", [])
                 ],
-            }
-            
+                is_amm=False,
+            )
+
         except Exception as e:
             logger.error(f"Error fetching orderbook: {e}")
             return None
     
     async def place_order(
         self,
-        token_id: str,
-        side: str,  # "buy" or "sell"
+        market_id: str,
+        outcome: str,                    # "YES" → buy, "NO" → sell YES token
         size: Decimal,
         price: Optional[Decimal] = None,
-        order_type: str = "GTC",  # GTC, FOK, GTD
+        order_type: str = "GTC",
     ) -> Optional[str]:
-        """
-        Place order on market.
-        
-        Args:
-            token_id: Token ID to trade
-            side: "buy" or "sell"
-            size: Order size (number of outcome tokens)
-            price: Limit price (0-1 range), None for market order
-            order_type: Order type (GTC, FOK, GTD)
-            
-        Returns:
-            Order ID if successful
-        """
+        """Place a limit/market order. *market_id* is the YES token ID."""
         if not self.client:
             logger.error("Client not connected")
             return None
-        
+
         try:
-            # Convert to Polymarket format
-            poly_side = BUY if side.lower() == "buy" else SELL
-            
-            # If no price specified, use market order (best available price)
+            side = BUY if outcome.upper() == "YES" else SELL
+
             if price is None:
-                # Get best price from orderbook
-                book = await self.get_orderbook(token_id)
+                book = await self.get_orderbook(market_id)
                 if not book:
-                    logger.error("Cannot get market price")
+                    logger.error("Cannot get market price for order")
                     return None
-                
-                if side.lower() == "buy":
-                    price = book["asks"][0]["price"] if book["asks"] else Decimal("0.5")
+                if outcome.upper() == "YES":
+                    price = book.asks[0]["price"] if book.asks else Decimal("0.5")
                 else:
-                    price = book["bids"][0]["price"] if book["bids"] else Decimal("0.5")
-            
-            # Create order arguments
+                    price = book.bids[0]["price"] if book.bids else Decimal("0.5")
+
             order_args = OrderArgs(
-                token_id=token_id,
+                token_id=market_id,
                 price=float(price),
                 size=float(size),
-                side=poly_side,
-                fee_rate_bps=0,  # Fee in basis points
+                side=side,
+                fee_rate_bps=0,
             )
-            
-            # Build and sign order
             signed_order = self.client.create_order(order_args)
-            
-            # Submit order
             response = self.client.post_order(signed_order, order_type=order_type)
-            
+
             if response and "orderID" in response:
                 order_id = response["orderID"]
-                
-                logger.info(
-                    f"Order placed: {order_id} "
-                    f"{side.upper()} {size} @ {price:.4f}"
-                )
-                
+                logger.info(f"Order placed: {order_id} {outcome.upper()} {size} @ {price:.4f}")
                 return order_id
-            else:
-                logger.error(f"Order placement failed: {response}")
-                return None
-                
+
+            logger.error(f"Order placement failed: {response}")
+            return None
+
         except Exception as e:
             logger.error(f"Error placing order: {e}")
             import traceback
@@ -422,36 +396,27 @@ class PolymarketClient:
         """
         return await self._get_balance_internal() or {}
     
-    async def get_trades(self, limit: int = 100) -> List[Dict[str, Any]]:
-        """
-        Get recent trades.
-        
-        Args:
-            limit: Maximum trades to return
-            
-        Returns:
-            List of recent trades
-        """
+    async def get_trades(self, limit: int = 100) -> List[TradeRecord]:
+        """Return recent filled trades as normalised TradeRecord objects."""
         if not self.client:
             return []
-        
+
         try:
             trades = self.client.get_trades()
-            
-            recent_trades = []
-            for trade in trades[:limit]:
-                recent_trades.append({
-                    "trade_id": trade["id"],
-                    "order_id": trade["order_id"],
-                    "token_id": trade["asset_id"],
-                    "side": trade["side"],
-                    "price": Decimal(str(trade["price"])),
-                    "size": Decimal(str(trade["size"])),
-                    "timestamp": datetime.fromisoformat(trade["timestamp"]),
-                })
-            
-            return recent_trades
-            
+            return [
+                TradeRecord(
+                    trade_id=t["id"],
+                    market_id=t["asset_id"],
+                    side=t["side"],
+                    outcome="YES" if t["side"] == "BUY" else "NO",
+                    price=Decimal(str(t["price"])),
+                    size=Decimal(str(t["size"])),
+                    timestamp=datetime.fromisoformat(t["timestamp"]),
+                    metadata={"order_id": t.get("order_id")},
+                )
+                for t in trades[:limit]
+            ]
+
         except Exception as e:
             logger.error(f"Error fetching trades: {e}")
             return []

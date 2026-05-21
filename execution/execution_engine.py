@@ -1,6 +1,10 @@
 """
 Execution Engine
-Manages order placement, fills, and position lifecycle
+Manages order placement, fills, and position lifecycle.
+
+Platform-agnostic: accepts any BaseMarketClient implementation.
+Use `create_execution_engine("manifold")` or `create_execution_engine("polymarket")`
+to select the active platform without changing any other code.
 """
 import asyncio
 from decimal import Decimal
@@ -15,6 +19,7 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from execution.risk_engine import get_risk_engine, RiskEngine
+from execution.base_client import BaseMarketClient
 from core.strategy_brain.signal_processors.base_processor import SignalDirection
 
 
@@ -76,31 +81,21 @@ class Order:
 
 class ExecutionEngine:
     """
-    Execution engine that manages order lifecycle.
-    
-    Workflow:
-    1. Receive trading signal from strategy
-    2. Check risk limits
-    3. Calculate position size
-    4. Place order
-    5. Monitor fills
-    6. Manage position
-    7. Handle exits (stop loss, take profit)
+    Platform-agnostic execution engine.
+
+    Pass any BaseMarketClient (PolymarketClient or ManifoldClient) via the
+    *market_client* argument. When *dry_run=True* the client is never called —
+    orders are simulated locally, which is useful for unit tests.
     """
-    
+
     def __init__(
         self,
         risk_engine: Optional[RiskEngine] = None,
-        dry_run: bool = True,  # Simulate orders without real execution
+        market_client: Optional[BaseMarketClient] = None,
+        dry_run: bool = True,
     ):
-        """
-        Initialize execution engine.
-        
-        Args:
-            risk_engine: Risk management engine
-            dry_run: If True, simulate orders (no real trading)
-        """
         self.risk_engine = risk_engine or get_risk_engine()
+        self.market_client = market_client
         self.dry_run = dry_run
         
         # Order tracking
@@ -256,31 +251,40 @@ class ExecutionEngine:
             f"{side.value.upper()} ${size:.2f}"
         )
         
-        # In live mode, submit to Polymarket via Nautilus
         if not self.dry_run:
+            if not self.market_client or not self.market_client.is_connected:
+                logger.error("No connected market client — cannot place live order")
+                order.status = OrderStatus.REJECTED
+                return None
+
             try:
-                from execution.nautilus_polymarket_integration import get_polymarket_integration
-                
-                integration = get_polymarket_integration(simulation_mode=False)
-                
-                # Place order via Nautilus
-                order_id_poly = await integration.place_market_order(
-                    side=side.value,
-                    size_usd=size,
-                    metadata=metadata,
+                outcome = "YES" if side == OrderSide.BUY else "NO"
+                market_id = (metadata or {}).get("market_id", "")
+                if not market_id:
+                    logger.error("metadata['market_id'] required for live orders")
+                    order.status = OrderStatus.REJECTED
+                    return None
+
+                remote_id = await self.market_client.place_order(
+                    market_id=market_id,
+                    outcome=outcome,
+                    size=size,
                 )
-                
-                if order_id_poly:
+
+                if remote_id:
                     order.status = OrderStatus.SUBMITTED
-                    order.metadata["polymarket_order_id"] = order_id_poly
-                    logger.info(f"Order submitted to Polymarket: {order_id_poly}")
+                    order.metadata["remote_order_id"] = remote_id
+                    order.metadata["platform"] = self.market_client.platform_name
+                    logger.info(
+                        f"Order submitted to {self.market_client.platform_name}: {remote_id}"
+                    )
                 else:
                     order.status = OrderStatus.REJECTED
-                    logger.error("Polymarket order submission failed")
+                    logger.error(f"Order submission failed on {self.market_client.platform_name}")
                     return None
-                    
+
             except Exception as e:
-                logger.error(f"Failed to submit to Polymarket: {e}")
+                logger.error(f"Failed to submit order: {e}")
                 order.status = OrderStatus.REJECTED
                 return None
         else:
@@ -517,9 +521,51 @@ class ExecutionEngine:
 # Singleton instance
 _execution_engine_instance = None
 
+
 def get_execution_engine() -> ExecutionEngine:
-    """Get singleton execution engine."""
+    """Get singleton execution engine (dry-run, no market client)."""
     global _execution_engine_instance
     if _execution_engine_instance is None:
         _execution_engine_instance = ExecutionEngine(dry_run=True)
     return _execution_engine_instance
+
+
+async def create_execution_engine(
+    platform: str = "manifold",
+    dry_run: bool = False,
+) -> ExecutionEngine:
+    """
+    Factory: create and connect an ExecutionEngine for the given platform.
+
+    Args:
+        platform: "manifold" or "polymarket"
+        dry_run:  If True, orders are simulated locally (client still connects
+                  so market data is live, but no real bets are placed).
+
+    Usage:
+        engine = await create_execution_engine("manifold")
+        engine = await create_execution_engine("polymarket", dry_run=True)
+    """
+    platform = platform.lower()
+
+    if platform == "manifold":
+        from execution.manifold_client import get_manifold_client
+        client: BaseMarketClient = get_manifold_client()
+    elif platform == "polymarket":
+        from execution.polymarket_client import get_polymarket_client
+        client = get_polymarket_client()
+    else:
+        raise ValueError(f"Unknown platform '{platform}'. Choose 'manifold' or 'polymarket'.")
+
+    connected = await client.connect()
+    if not connected:
+        raise RuntimeError(f"Failed to connect to {platform}")
+
+    engine = ExecutionEngine(
+        market_client=client,
+        dry_run=dry_run,
+    )
+    logger.info(
+        f"ExecutionEngine ready — platform={platform}, dry_run={dry_run}"
+    )
+    return engine
